@@ -12,17 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package testutil
+package testutil_test
 
 import (
 	"strconv"
 
-	structpb "github.com/golang/protobuf/ptypes/struct"
-	spannerpb "google.golang.org/genproto/googleapis/spanner/v1"
-	"google.golang.org/grpc/codes"
-)
+	. "cloud.google.com/go/spanner/internal/testutil"
 
-import (
 	"context"
 	"flag"
 	"fmt"
@@ -32,10 +28,15 @@ import (
 	"strings"
 	"testing"
 
+	structpb "github.com/golang/protobuf/ptypes/struct"
+	spannerpb "google.golang.org/genproto/googleapis/spanner/v1"
+	"google.golang.org/grpc/codes"
+
 	apiv1 "cloud.google.com/go/spanner/apiv1"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
+
 	gstatus "google.golang.org/grpc/status"
 )
 
@@ -133,7 +134,7 @@ func TestSpannerCreateSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Index(resp.Name, expectedName) != 0 {
-		t.Errorf("wrong name %s, should start with %s)", resp.Name, expectedName)
+		t.Errorf("Session name mismatch\nGot: %s\nWant: Name should start with %s)", resp.Name, expectedName)
 	}
 }
 
@@ -155,7 +156,7 @@ func TestSpannerCreateSession_Unavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Index(resp.Name, expectedName) != 0 {
-		t.Errorf("wrong name %s, should start with %s)", resp.Name, expectedName)
+		t.Errorf("Session name mismatch\nGot: %s\nWant: Name should start with %s)", resp.Name, expectedName)
 	}
 }
 
@@ -182,7 +183,7 @@ func TestSpannerGetSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	if getResp.Name != getRequest.Name {
-		t.Errorf("wrong name %s, expected %s)", getResp.Name, getRequest.Name)
+		t.Errorf("Session name mismatch\nGot: %s\nWant: Name should start with %s)", getResp.Name, getRequest.Name)
 	}
 }
 
@@ -219,12 +220,12 @@ func TestSpannerListSessions(t *testing.T) {
 			t.Fatal(err)
 		}
 		if strings.Index(session.Name, expectedName) != 0 {
-			t.Errorf("wrong name %s, should start with %s)", session.Name, expectedName)
+			t.Errorf("Session name mismatch\nGot: %s\nWant: Name should start with %s)", session.Name, expectedName)
 		}
 		sessionCount++
 	}
 	if sessionCount != expectedNumberOfSessions {
-		t.Errorf("wrong number of sessions: %d, expected %d", sessionCount, expectedNumberOfSessions)
+		t.Errorf("Session count mismatch\nGot: %d\nWant: %d", sessionCount, expectedNumberOfSessions)
 	}
 }
 
@@ -266,7 +267,7 @@ func TestSpannerDeleteSession(t *testing.T) {
 		sessionCount++
 	}
 	if sessionCount != expectedNumberOfSessions {
-		t.Errorf("wrong number of sessions: %d, expected %d", sessionCount, expectedNumberOfSessions)
+		t.Errorf("Session count mismatch\nGot: %d\nWant: %d", sessionCount, expectedNumberOfSessions)
 	}
 	// Re-list all sessions. This should now be empty.
 	listResp = c.ListSessions(context.Background(), listRequest)
@@ -318,12 +319,12 @@ func TestSpannerExecuteSql(t *testing.T) {
 	var rowCount int64
 	for _, row := range response.Rows {
 		if len(row.Values) != selectColCount {
-			t.Fatalf("unexpected number of columns: %d, expected %d", len(row.Values), selectColCount)
+			t.Fatalf("Column count mismatch\nGot: %d\nWant: %d", len(row.Values), selectColCount)
 		}
 		rowCount++
 	}
 	if rowCount != selectRowCount {
-		t.Fatalf("unexpected number of rows: %d, expected %d", rowCount, selectRowCount)
+		t.Fatalf("Row count mismatch\nGot: %d\nWant: %d", rowCount, selectRowCount)
 	}
 }
 
@@ -363,7 +364,7 @@ func TestSpannerExecuteSqlDml(t *testing.T) {
 	}
 	var rowCount int64 = response.Stats.GetRowCountExact()
 	if rowCount != updateRowCount {
-		t.Fatalf("unexpected number of rows updated: %d, expected %d", rowCount, updateRowCount)
+		t.Fatalf("Update count mismatch\nGot: %d\nWant: %d", rowCount, updateRowCount)
 	}
 }
 
@@ -406,32 +407,38 @@ func TestSpannerExecuteStreamingSql(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	partial, err := response.Recv()
-	if err != nil {
-		t.Fatal(err)
-	}
 	var rowIndex int64
-	colCount := len(partial.Metadata.RowType.Fields)
-	if colCount != selectColCount {
-		t.Fatalf("unexpected number of columns: %d, expected %d", colCount, selectColCount)
-	}
+	var colCount int
 	for {
-		for col := 0; col < colCount; col++ {
-			val, err := strconv.ParseInt(partial.Values[rowIndex*int64(colCount)+int64(col)].GetStringValue(), 10, 64)
+		for rowIndexInPartial := int64(0); rowIndexInPartial < MaxRowsPerPartialResultSet; rowIndexInPartial++ {
+			partial, err := response.Recv()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if val != selectValues[rowIndex] {
-				t.Fatalf("Unexpected value at index %d. Expected %d, got %d", rowIndex, selectValues[rowIndex], val)
+			if rowIndex == 0 {
+				colCount = len(partial.Metadata.RowType.Fields)
+				if colCount != selectColCount {
+					t.Fatalf("Column count mismatch\nGot: %d\nWant: %d", colCount, selectColCount)
+				}
 			}
+			for col := 0; col < colCount; col++ {
+				pIndex := rowIndexInPartial*int64(colCount) + int64(col)
+				val, err := strconv.ParseInt(partial.Values[pIndex].GetStringValue(), 10, 64)
+				if err != nil {
+					t.Fatalf("Error parsing integer at #%d: %v", pIndex, err)
+				}
+				if val != selectValues[rowIndex] {
+					t.Fatalf("Value mismatch at index %d\nGot: %d\nWant: %d", rowIndex, val, selectValues[rowIndex])
+				}
+			}
+			rowIndex++
 		}
-		rowIndex++
 		if rowIndex == selectRowCount {
 			break
 		}
 	}
 	if rowIndex != selectRowCount {
-		t.Fatalf("unexpected number of rows: %d, expected %d", rowIndex, selectRowCount)
+		t.Fatalf("Row count mismatch\nGot: %d\nWant: %d", rowIndex, selectRowCount)
 	}
 }
 
@@ -476,12 +483,12 @@ func TestSpannerExecuteBatchDml(t *testing.T) {
 	for _, res := range response.ResultSets {
 		var rowCount int64 = res.Stats.GetRowCountExact()
 		if rowCount != updateRowCount {
-			t.Fatalf("unexpected number of rows updated: %d, expected %d", rowCount, updateRowCount)
+			t.Fatalf("Update count mismatch\nGot: %d\nWant: %d", rowCount, updateRowCount)
 		}
 		totalRowCount += rowCount
 	}
 	if totalRowCount != updateRowCount*int64(len(statements)) {
-		t.Fatalf("unexpected number of total rows updated: %d, expected %d", totalRowCount, updateRowCount*int64(len(statements)))
+		t.Fatalf("Total update count mismatch\nGot: %d\nWant: %d", totalRowCount, updateRowCount*int64(len(statements)))
 	}
 }
 
@@ -514,7 +521,7 @@ func TestBeginTransaction(t *testing.T) {
 	}
 	expectedName := fmt.Sprintf("%s/transactions/", session.Name)
 	if strings.Index(string(tx.Id), expectedName) != 0 {
-		t.Errorf("wrong name %s, should start with %s)", string(tx.Id), expectedName)
+		t.Errorf("Transaction name mismatch\nGot: %s\nWant: Name should start with %s)", string(tx.Id), expectedName)
 	}
 }
 

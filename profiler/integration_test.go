@@ -102,7 +102,7 @@ func (tc *goGCETestCase) initializeStartupScript(template *template.Template, co
 			ErrorString    string
 			MutexProfiling bool
 		}{
-			Service:        tc.name,
+			Service:        tc.InstanceConfig.Name,
 			GoVersion:      tc.goVersion,
 			Commit:         commit,
 			ErrorString:    errorString,
@@ -128,10 +128,8 @@ func TestAgentIntegration(t *testing.T) {
 		t.Skip("skipping profiler integration test when GCLOUD_TESTS_GOLANG_PROJECT_ID variable is not set")
 	}
 
-	zone := os.Getenv("GCLOUD_TESTS_GOLANG_PROFILER_ZONE")
-	if zone == "" {
-		t.Fatalf("GCLOUD_TESTS_GOLANG_PROFILER_ZONE environment variable must be set when integration test is requested")
-	}
+	// all us-west1 zones
+	zones := []string{"us-west1-a", "us-west1-b", "us-west1-c"}
 
 	// Figure out the Git commit of the current directory. The source checkout in
 	// the test VM will run in the same commit. Note that any local changes to
@@ -185,11 +183,10 @@ func TestAgentIntegration(t *testing.T) {
 		{
 			InstanceConfig: proftest.InstanceConfig{
 				ProjectID:   projectID,
-				Zone:        zone,
 				Name:        fmt.Sprintf("profiler-test-gomaster-%s", runID),
 				MachineType: "n1-standard-1",
 			},
-			name:             fmt.Sprintf("profiler-test-gomaster-%s-gce", runID),
+			name:             "profiler-test-gomaster",
 			wantProfileTypes: []string{"CPU", "HEAP", "THREADS", "CONTENTION", "HEAP_ALLOC"},
 			goVersion:        "master",
 			mutexProfiling:   true,
@@ -197,11 +194,10 @@ func TestAgentIntegration(t *testing.T) {
 		{
 			InstanceConfig: proftest.InstanceConfig{
 				ProjectID:   projectID,
-				Zone:        zone,
 				Name:        fmt.Sprintf("profiler-test-go%s-%s", goVersionName, runID),
 				MachineType: "n1-standard-1",
 			},
-			name:             fmt.Sprintf("profiler-test-go%s-%s-gce", goVersionName, runID),
+			name:             fmt.Sprintf("profiler-test-go%s", goVersionName),
 			wantProfileTypes: []string{"CPU", "HEAP", "THREADS", "CONTENTION", "HEAP_ALLOC"},
 			goVersion:        goVersion,
 			mutexProfiling:   true,
@@ -217,8 +213,16 @@ func TestAgentIntegration(t *testing.T) {
 				t.Fatalf("failed to initialize startup script")
 			}
 
-			if err := gceTr.StartInstance(ctx, &tc.InstanceConfig); err != nil {
-				t.Fatal(err)
+			for i := range zones {
+				tc.InstanceConfig.Zone = zones[i]
+				if err := gceTr.StartInstance(ctx, &tc.InstanceConfig); err != nil {
+					if strings.Contains(err.Error(), "failed to create instance") && i < (len(zones)-1) {
+						// try other zones if instance failed to create
+						continue
+					}
+					t.Fatal(err)
+				}
+				break
 			}
 			defer func() {
 				if gceTr.DeleteInstance(ctx, &tc.InstanceConfig); err != nil {
@@ -236,13 +240,13 @@ func TestAgentIntegration(t *testing.T) {
 			endTime := timeNow.Format(time.RFC3339)
 			startTime := timeNow.Add(-1 * time.Hour).Format(time.RFC3339)
 			for _, pType := range tc.wantProfileTypes {
-				pr, err := tr.QueryProfiles(tc.ProjectID, tc.name, startTime, endTime, pType)
+				pr, err := tr.QueryProfilesWithZone(tc.ProjectID, tc.InstanceConfig.Name, startTime, endTime, pType, tc.Zone)
 				if err != nil {
-					t.Errorf("QueryProfiles(%s, %s, %s, %s, %s) got error: %v", tc.ProjectID, tc.name, startTime, endTime, pType, err)
+					t.Errorf("QueryProfilesWithZone(%s, %s, %s, %s, %s, %s) got error: %v", tc.ProjectID, tc.InstanceConfig.Name, startTime, endTime, pType, tc.Zone, err)
 					continue
 				}
 				if err := pr.HasFunction("busywork"); err != nil {
-					t.Errorf("HasFunction(%s, %s, %s, %s, %s) got error: %v", tc.ProjectID, tc.name, startTime, endTime, pType, err)
+					t.Errorf("HasFunction(%s, %s, %s, %s, %s) got error: %v", tc.ProjectID, tc.InstanceConfig.Name, startTime, endTime, pType, err)
 				}
 			}
 		})

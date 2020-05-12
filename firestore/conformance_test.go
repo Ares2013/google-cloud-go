@@ -61,19 +61,21 @@ func TestConformance(t *testing.T) {
 			t.Fatalf("%s: %v", f.Name(), err)
 		}
 
-		var tc pb.Test
-		if err := jsonpb.Unmarshal(bytes.NewReader(inBytes), &tc); err != nil {
+		var tf pb.TestFile
+		if err := jsonpb.Unmarshal(bytes.NewReader(inBytes), &tf); err != nil {
 			t.Fatalf("unmarshalling %s: %v", f.Name(), err)
 		}
 
-		t.Run(tc.Description, func(t *testing.T) {
-			c, srv, cleanup := newMock(t)
-			defer cleanup()
+		for _, tc := range tf.Tests {
+			t.Run(tc.Description, func(t *testing.T) {
+				c, srv, cleanup := newMock(t)
+				defer cleanup()
 
-			if err := runTest(&tc, c, srv); err != nil {
-				t.Fatal(err)
-			}
-		})
+				if err := runTest(tc, c, srv); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
 	}
 }
 
@@ -208,7 +210,7 @@ func runTest(test *pb.Test, c *Client, srv *mockServer) error {
 		got, err := nSnapshots(iter, len(typedTestcase.Listen.Snapshots))
 		if err != nil {
 			return err
-		} else if diff := cmp.Diff(got, typedTestcase.Listen.Snapshots); diff != "" {
+		} else if diff := cmp.Diff(got, typedTestcase.Listen.Snapshots, cmp.Comparer(proto.Equal)); diff != "" {
 			return errors.New(diff)
 		}
 		if typedTestcase.Listen.IsError {

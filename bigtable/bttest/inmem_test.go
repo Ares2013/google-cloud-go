@@ -26,10 +26,10 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/internal/testutil"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 	btapb "google.golang.org/genproto/googleapis/bigtable/admin/v2"
 	btpb "google.golang.org/genproto/googleapis/bigtable/v2"
 	"google.golang.org/grpc"
@@ -133,6 +133,42 @@ func TestConcurrentMutationsReadModifyAndGC(t *testing.T) {
 	case <-done:
 	case <-time.After(1 * time.Second):
 		t.Error("Concurrent mutations and GCs haven't completed after 1s")
+	}
+}
+
+func TestCreateTableResponse(t *testing.T) {
+	// We need to ensure that invoking CreateTable returns
+	// the  ColumnFamilies as well as Granularity.
+	// See issue https://github.com/googleapis/google-cloud-go/issues/1512.
+	s := &server{
+		tables: make(map[string]*table),
+	}
+	ctx := context.Background()
+	got, err := s.CreateTable(ctx, &btapb.CreateTableRequest{
+		Parent:  "projects/issue-1512/instances/instance",
+		TableId: "table",
+		Table: &btapb.Table{
+			ColumnFamilies: map[string]*btapb.ColumnFamily{
+				"cf1": {GcRule: &btapb.GcRule{Rule: &btapb.GcRule_MaxNumVersions{MaxNumVersions: 123}}},
+				"cf2": {GcRule: &btapb.GcRule{Rule: &btapb.GcRule_MaxNumVersions{MaxNumVersions: 456}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Creating table: %v", err)
+	}
+
+	want := &btapb.Table{
+		Name: "projects/issue-1512/instances/instance/tables/table",
+		// If no Granularity was specified, we should get back "MILLIS".
+		Granularity: btapb.Table_MILLIS,
+		ColumnFamilies: map[string]*btapb.ColumnFamily{
+			"cf1": {GcRule: &btapb.GcRule{Rule: &btapb.GcRule_MaxNumVersions{MaxNumVersions: 123}}},
+			"cf2": {GcRule: &btapb.GcRule{Rule: &btapb.GcRule_MaxNumVersions{MaxNumVersions: 456}}},
+		},
+	}
+	if diff := testutil.Diff(got, want); diff != "" {
+		t.Fatalf("Response mismatch: got - want +\n%s", diff)
 	}
 }
 
@@ -1013,8 +1049,13 @@ func TestCheckAndMutateRowWithPredicate(t *testing.T) {
 			// bttest for some reason undeterministically returns:
 			//      RowStatus: &bigtable.ReadRowsResponse_CellChunk_CommitRow{CommitRow: true},
 			// so we'll ignore that field during comparison.
-			ignore := cmpopts.IgnoreFields(btpb.ReadRowsResponse_CellChunk{}, "RowStatus")
-			diff := cmp.Diff(gotCellChunks, wantCellChunks, ignore)
+			scrubRowStatus := func(cs []*btpb.ReadRowsResponse_CellChunk) []*btpb.ReadRowsResponse_CellChunk {
+				for _, c := range cs {
+					c.RowStatus = nil
+				}
+				return cs
+			}
+			diff := cmp.Diff(scrubRowStatus(gotCellChunks), scrubRowStatus(wantCellChunks), cmp.Comparer(proto.Equal))
 			if diff != "" {
 				t.Fatalf("unexpected response: %s", diff)
 			}
@@ -1109,7 +1150,17 @@ func TestServer_ReadModifyWriteRow(t *testing.T) {
 		},
 	}
 
-	diff := cmp.Diff(got, want, cmpopts.IgnoreFields(btpb.Cell{}, "TimestampMicros"))
+	scrubTimestamp := func(resp *btpb.ReadModifyWriteRowResponse) *btpb.ReadModifyWriteRowResponse {
+		for _, fam := range resp.GetRow().GetFamilies() {
+			for _, col := range fam.GetColumns() {
+				for _, cell := range col.GetCells() {
+					cell.TimestampMicros = 0
+				}
+			}
+		}
+		return resp
+	}
+	diff := cmp.Diff(scrubTimestamp(got), scrubTimestamp(want), cmp.Comparer(proto.Equal))
 	if diff != "" {
 		t.Errorf("unexpected response: %s", diff)
 	}
@@ -1316,7 +1367,7 @@ func TestFilterRow(t *testing.T) {
 			"fam": {
 				name: "fam",
 				cells: map[string][]cell{
-					"col": {{ts: 100, value: []byte("val")}},
+					"col": {{ts: 1000, value: []byte("val")}},
 				},
 			},
 		},
@@ -1347,8 +1398,14 @@ func TestFilterRow(t *testing.T) {
 		{&btpb.RowFilter{Filter: &btpb.RowFilter_ValueRegexFilter{[]byte("va")}}, false},
 		{&btpb.RowFilter{Filter: &btpb.RowFilter_ValueRegexFilter{[]byte("VAL")}}, false},
 		{&btpb.RowFilter{Filter: &btpb.RowFilter_ValueRegexFilter{[]byte("moo")}}, false},
+
+		{&btpb.RowFilter{Filter: &btpb.RowFilter_TimestampRangeFilter{&btpb.TimestampRange{StartTimestampMicros: int64(0), EndTimestampMicros: int64(1000)}}}, false},
+		{&btpb.RowFilter{Filter: &btpb.RowFilter_TimestampRangeFilter{&btpb.TimestampRange{StartTimestampMicros: int64(1000), EndTimestampMicros: int64(2000)}}}, true},
 	} {
-		got, _ := filterRow(test.filter, row.copy())
+		got, err := filterRow(test.filter, row.copy())
+		if err != nil {
+			t.Errorf("%s: got unexpected error: %v", proto.CompactTextString(test.filter), err)
+		}
 		if got != test.want {
 			t.Errorf("%s: got %t, want %t", proto.CompactTextString(test.filter), got, test.want)
 		}
@@ -1362,7 +1419,7 @@ func TestFilterRowWithErrors(t *testing.T) {
 			"fam": {
 				name: "fam",
 				cells: map[string][]cell{
-					"col": {{ts: 100, value: []byte("val")}},
+					"col": {{ts: 1000, value: []byte("val")}},
 				},
 			},
 		},
@@ -1385,8 +1442,10 @@ func TestFilterRowWithErrors(t *testing.T) {
 			},
 		}}},
 
-		{&btpb.RowFilter{Filter: &btpb.RowFilter_RowSampleFilter{0.0}}}, // 0.0 is invalid.
-		{&btpb.RowFilter{Filter: &btpb.RowFilter_RowSampleFilter{1.0}}}, // 1.0 is invalid.
+		{&btpb.RowFilter{Filter: &btpb.RowFilter_RowSampleFilter{0.0}}},                                                                                        // 0.0 is invalid.
+		{&btpb.RowFilter{Filter: &btpb.RowFilter_RowSampleFilter{1.0}}},                                                                                        // 1.0 is invalid.
+		{&btpb.RowFilter{Filter: &btpb.RowFilter_TimestampRangeFilter{&btpb.TimestampRange{StartTimestampMicros: int64(1), EndTimestampMicros: int64(1000)}}}}, // Server only supports millisecond precision.
+		{&btpb.RowFilter{Filter: &btpb.RowFilter_TimestampRangeFilter{&btpb.TimestampRange{StartTimestampMicros: int64(1000), EndTimestampMicros: int64(1)}}}}, // Server only supports millisecond precision.
 	} {
 		got, err := filterRow(test.badRegex, row.copy())
 		if got != false {
@@ -1428,7 +1487,7 @@ func TestFilterRowWithBinaryColumnQualifier(t *testing.T) {
 			"fam": {
 				name: "fam",
 				cells: map[string][]cell{
-					string(rs): {{ts: 100, value: []byte("val")}},
+					string(rs): {{ts: 1000, value: []byte("val")}},
 				},
 			},
 		},
@@ -1555,7 +1614,104 @@ func TestFilterRowWithSingleColumnQualifier(t *testing.T) {
 			},
 		},
 	}
-	if diff := cmp.Diff(got, want); diff != "" {
+	if diff := cmp.Diff(got, want, cmp.Comparer(proto.Equal)); diff != "" {
 		t.Fatalf("Response mismatch: got: + want -\n%s", diff)
+	}
+}
+
+func TestValueFilterRowWithAlternationInRegex(t *testing.T) {
+	// Test that regex alternation is applied properly.
+	// See Issue https://github.com/googleapis/google-cloud-go/issues/1499
+	ctx := context.Background()
+	srv := &server{tables: make(map[string]*table)}
+
+	tblReq := &btapb.CreateTableRequest{
+		Parent:  "issue-1499",
+		TableId: "table_id",
+		Table: &btapb.Table{
+			ColumnFamilies: map[string]*btapb.ColumnFamily{
+				"cf": {},
+			},
+		},
+	}
+	tbl, err := srv.CreateTable(ctx, tblReq)
+	if err != nil {
+		t.Fatalf("Failed to create the table: %v", err)
+	}
+
+	entries := []struct {
+		row   string
+		value []byte
+	}{
+		{"row1", []byte("")},
+		{"row2", []byte{'x'}},
+		{"row3", []byte{'a'}},
+		{"row4", []byte{'m'}},
+	}
+
+	for _, entry := range entries {
+		req := &btpb.MutateRowRequest{
+			TableName: tbl.Name,
+			RowKey:    []byte(entry.row),
+			Mutations: []*btpb.Mutation{{
+				Mutation: &btpb.Mutation_SetCell_{SetCell: &btpb.Mutation_SetCell{
+					FamilyName:      "cf",
+					ColumnQualifier: []byte("cq"),
+					TimestampMicros: 1000,
+					Value:           entry.value,
+				}},
+			}},
+		}
+		if _, err := srv.MutateRow(ctx, req); err != nil {
+			t.Fatalf("Failed to insert entry %v into server: %v", entry, err)
+		}
+	}
+
+	// After insertion now it is time for querying.
+	req := &btpb.ReadRowsRequest{
+		TableName: tbl.Name,
+		Rows:      &btpb.RowSet{},
+		Filter: &btpb.RowFilter{
+			Filter: &btpb.RowFilter_ValueRegexFilter{
+				ValueRegexFilter: []byte("|a"),
+			},
+		},
+	}
+
+	rrss := new(MockReadRowsServer)
+	if err := srv.ReadRows(req, rrss); err != nil {
+		t.Fatalf("Failed to read rows: %v", err)
+	}
+
+	var gotChunks []*btpb.ReadRowsResponse_CellChunk
+	for _, res := range rrss.responses {
+		gotChunks = append(gotChunks, res.Chunks...)
+	}
+
+	// Only row1 "" and row3 "a" should be matched.
+	wantChunks := []*btpb.ReadRowsResponse_CellChunk{
+		{
+			RowKey:          []byte("row1"),
+			FamilyName:      &wrappers.StringValue{Value: "cf"},
+			Qualifier:       &wrappers.BytesValue{Value: []byte("cq")},
+			TimestampMicros: 1000,
+			Value:           []byte(""),
+			RowStatus: &btpb.ReadRowsResponse_CellChunk_CommitRow{
+				CommitRow: true,
+			},
+		},
+		{
+			RowKey:          []byte("row3"),
+			FamilyName:      &wrappers.StringValue{Value: "cf"},
+			Qualifier:       &wrappers.BytesValue{Value: []byte("cq")},
+			TimestampMicros: 1000,
+			Value:           []byte("a"),
+			RowStatus: &btpb.ReadRowsResponse_CellChunk_CommitRow{
+				CommitRow: true,
+			},
+		},
+	}
+	if diff := cmp.Diff(gotChunks, wantChunks, cmp.Comparer(proto.Equal)); diff != "" {
+		t.Fatalf("Response chunks mismatch: got: + want -\n%s", diff)
 	}
 }

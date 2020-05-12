@@ -27,13 +27,18 @@ import (
 
 // Check that stats are being exported.
 func TestOCStats(t *testing.T) {
+	// TestExporter is currently not thread safe, but that is being fixed.
+	t.Skip("TestExporter is not thread safe")
 	te := testutil.NewTestExporter()
 	defer te.Unregister()
 
 	ms := stestutil.NewMockCloudSpanner(t, trxTs)
 	ms.Serve()
 	ctx := context.Background()
-	c, err := NewClient(ctx, "projects/P/instances/I/databases/D",
+	c, err := NewClientWithConfig(ctx, "projects/P/instances/I/databases/D",
+		ClientConfig{SessionPoolConfig: SessionPoolConfig{
+			MinOpened: 0,
+		}},
 		option.WithEndpoint(ms.Addr()),
 		option.WithGRPCDialOption(grpc.WithInsecure()),
 		option.WithoutAuthentication())

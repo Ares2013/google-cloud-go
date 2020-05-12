@@ -21,11 +21,15 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"cloud.google.com/go/spanner/internal/testutil"
+	. "cloud.google.com/go/spanner/internal/testutil"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/google/go-cmp/cmp"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	sppb "google.golang.org/genproto/googleapis/spanner/v1"
 	"google.golang.org/grpc/codes"
 	gstatus "google.golang.org/grpc/status"
@@ -35,8 +39,8 @@ import (
 func TestSingle(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 
 	txn := client.Single()
 	defer txn.Close()
@@ -49,8 +53,8 @@ func TestSingle(t *testing.T) {
 		t.Fatalf("Second acquire for single use, got %v, want %v.", e, wantErr)
 	}
 
-	// Only one CreateSessionRequest is sent.
-	if _, err := shouldHaveReceived(server.testSpanner, []interface{}{&sppb.CreateSessionRequest{}}); err != nil {
+	// Only one BatchCreateSessionsRequest is sent.
+	if _, err := shouldHaveReceived(server.TestSpanner, []interface{}{&sppb.BatchCreateSessionsRequest{}}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -59,16 +63,16 @@ func TestSingle(t *testing.T) {
 func TestReadOnlyTransaction_RecoverFromFailure(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 
 	txn := client.ReadOnlyTransaction()
 	defer txn.Close()
 
 	// First request will fail.
 	errUsr := gstatus.Error(codes.Unknown, "error")
-	server.testSpanner.PutExecutionTime(testutil.MethodBeginTransaction,
-		testutil.SimulatedExecutionTime{
+	server.TestSpanner.PutExecutionTime(MethodBeginTransaction,
+		SimulatedExecutionTime{
 			Errors: []error{errUsr},
 		})
 
@@ -86,8 +90,8 @@ func TestReadOnlyTransaction_RecoverFromFailure(t *testing.T) {
 func TestReadOnlyTransaction_UseAfterClose(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	_, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 
 	txn := client.ReadOnlyTransaction()
 	txn.Close()
@@ -102,12 +106,12 @@ func TestReadOnlyTransaction_UseAfterClose(t *testing.T) {
 func TestReadOnlyTransaction_Concurrent(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 	txn := client.ReadOnlyTransaction()
 	defer txn.Close()
 
-	server.testSpanner.Freeze()
+	server.TestSpanner.Freeze()
 	var (
 		sh1 *sessionHandle
 		sh2 *sessionHandle
@@ -130,7 +134,7 @@ func TestReadOnlyTransaction_Concurrent(t *testing.T) {
 	// TODO(deklerk): Get rid of this.
 	<-time.After(100 * time.Millisecond)
 
-	server.testSpanner.Unfreeze()
+	server.TestSpanner.Unfreeze()
 	wg.Wait()
 	if sh1.session.id != sh2.session.id {
 		t.Fatalf("Expected acquire to get same session handle, got %v and %v.", sh1, sh2)
@@ -143,8 +147,8 @@ func TestReadOnlyTransaction_Concurrent(t *testing.T) {
 func TestApply_Single(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 
 	ms := []*Mutation{
 		Insert("Accounts", []string{"AccountId", "Nickname", "Balance"}, []interface{}{int64(1), "Foo", int64(50)}),
@@ -154,8 +158,8 @@ func TestApply_Single(t *testing.T) {
 		t.Fatalf("applyAtLeastOnce retry on abort, got %v, want nil.", e)
 	}
 
-	if _, err := shouldHaveReceived(server.testSpanner, []interface{}{
-		&sppb.CreateSessionRequest{},
+	if _, err := shouldHaveReceived(server.TestSpanner, []interface{}{
+		&sppb.BatchCreateSessionsRequest{},
 		&sppb.CommitRequest{},
 	}); err != nil {
 		t.Fatal(err)
@@ -166,14 +170,13 @@ func TestApply_Single(t *testing.T) {
 func TestApply_RetryOnAbort(t *testing.T) {
 	ctx := context.Background()
 	t.Parallel()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 
 	// First commit will fail, and the retry will begin a new transaction.
-	errAbrt := spannerErrorf(codes.Aborted, "")
-	server.testSpanner.PutExecutionTime(testutil.MethodCommitTransaction,
-		testutil.SimulatedExecutionTime{
-			Errors: []error{errAbrt},
+	server.TestSpanner.PutExecutionTime(MethodCommitTransaction,
+		SimulatedExecutionTime{
+			Errors: []error{newAbortedErrorWithMinimalRetryDelay()},
 		})
 
 	ms := []*Mutation{
@@ -184,8 +187,8 @@ func TestApply_RetryOnAbort(t *testing.T) {
 		t.Fatalf("ReadWriteTransaction retry on abort, got %v, want nil.", e)
 	}
 
-	if _, err := shouldHaveReceived(server.testSpanner, []interface{}{
-		&sppb.CreateSessionRequest{},
+	if _, err := shouldHaveReceived(server.TestSpanner, []interface{}{
+		&sppb.BatchCreateSessionsRequest{},
 		&sppb.BeginTransactionRequest{},
 		&sppb.CommitRequest{}, // First commit fails.
 		&sppb.BeginTransactionRequest{},
@@ -195,46 +198,63 @@ func TestApply_RetryOnAbort(t *testing.T) {
 	}
 }
 
-// Tests that NotFound errors cause failures, and aren't retried.
-func TestTransaction_NotFound(t *testing.T) {
+// Tests that SessionNotFound errors are retried.
+func TestTransaction_SessionNotFound(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 
-	wantErr := spannerErrorf(codes.NotFound, "Session not found")
-	server.testSpanner.PutExecutionTime(testutil.MethodBeginTransaction,
-		testutil.SimulatedExecutionTime{
-			Errors: []error{wantErr, wantErr, wantErr},
+	serverErr := newSessionNotFoundError("projects/p/instances/i/databases/d/sessions/s")
+	server.TestSpanner.PutExecutionTime(MethodBeginTransaction,
+		SimulatedExecutionTime{
+			Errors: []error{serverErr, serverErr, serverErr},
 		})
-	server.testSpanner.PutExecutionTime(testutil.MethodCommitTransaction,
-		testutil.SimulatedExecutionTime{
-			Errors: []error{wantErr, wantErr, wantErr},
+	server.TestSpanner.PutExecutionTime(MethodCommitTransaction,
+		SimulatedExecutionTime{
+			Errors: []error{serverErr},
 		})
 
 	txn := client.ReadOnlyTransaction()
 	defer txn.Close()
 
+	var wantErr error
 	if _, _, got := txn.acquire(ctx); !testEqual(wantErr, got) {
-		t.Fatalf("Expect acquire to fail, got %v, want %v.", got, wantErr)
+		t.Fatalf("Expect acquire to succeed, got %v, want %v.", got, wantErr)
 	}
 
-	// The failure should recycle the session, we expect it to be used in
-	// following requests.
+	// The server error should lead to a retry of the BeginTransaction call and
+	// a valid session handle to be returned that will be used by the following
+	// requests. Note that calling txn.Query(...) does not actually send the
+	// query to the (mock) server. That is done at the first call to
+	// RowIterator.Next. The following statement only verifies that the
+	// transaction is in a valid state and received a valid session handle.
 	if got := txn.Query(ctx, NewStatement("SELECT 1")); !testEqual(wantErr, got.err) {
-		t.Fatalf("Expect Query to fail, got %v, want %v.", got.err, wantErr)
+		t.Fatalf("Expect Query to succeed, got %v, want %v.", got.err, wantErr)
 	}
 
 	if got := txn.Read(ctx, "Users", KeySets(Key{"alice"}, Key{"bob"}), []string{"name", "email"}); !testEqual(wantErr, got.err) {
-		t.Fatalf("Expect Read to fail, got %v, want %v.", got.err, wantErr)
+		t.Fatalf("Expect Read to succeed, got %v, want %v.", got.err, wantErr)
 	}
 
+	wantErr = toSpannerError(newSessionNotFoundError("projects/p/instances/i/databases/d/sessions/s"))
 	ms := []*Mutation{
 		Insert("Accounts", []string{"AccountId", "Nickname", "Balance"}, []interface{}{int64(1), "Foo", int64(50)}),
 		Insert("Accounts", []string{"AccountId", "Nickname", "Balance"}, []interface{}{int64(2), "Bar", int64(1)}),
 	}
-	if _, got := client.Apply(ctx, ms, ApplyAtLeastOnce()); !testEqual(wantErr, got) {
-		t.Fatalf("Expect Apply to fail, got %v, want %v.", got, wantErr)
+	_, got := client.Apply(ctx, ms, ApplyAtLeastOnce())
+	if !cmp.Equal(wantErr, got,
+		cmp.AllowUnexported(Error{}), cmp.FilterPath(func(path cmp.Path) bool {
+			// Ignore Error Details and Error.trailers.
+			if strings.Contains(path.GoString(), "{*spanner.Error}.err.(*status.Error).Details") {
+				return true
+			}
+			if strings.Contains(path.GoString(), "{*spanner.Error}.trailers") {
+				return true
+			}
+			return false
+		}, cmp.Ignore())) {
+		t.Fatalf("Expect Apply to fail\nGot:  %v\nWant: %v\n", got, wantErr)
 	}
 }
 
@@ -243,8 +263,8 @@ func TestTransaction_NotFound(t *testing.T) {
 func TestReadWriteTransaction_ErrorReturned(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 
 	want := errors.New("an error")
 	_, got := client.ReadWriteTransaction(ctx, func(context.Context, *ReadWriteTransaction) error {
@@ -253,9 +273,9 @@ func TestReadWriteTransaction_ErrorReturned(t *testing.T) {
 	if got != want {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
-	requests := drainRequestsFromServer(server.testSpanner)
+	requests := drainRequestsFromServer(server.TestSpanner)
 	if err := compareRequests([]interface{}{
-		&sppb.CreateSessionRequest{},
+		&sppb.BatchCreateSessionsRequest{},
 		&sppb.BeginTransactionRequest{},
 		&sppb.RollbackRequest{}}, requests); err != nil {
 		// TODO: remove this once the session pool maintainer has been changed
@@ -265,7 +285,7 @@ func TestReadWriteTransaction_ErrorReturned(t *testing.T) {
 		// a fourth request. If this request is DeleteSession, that's OK and
 		// expected.
 		if err := compareRequests([]interface{}{
-			&sppb.CreateSessionRequest{},
+			&sppb.BatchCreateSessionsRequest{},
 			&sppb.BeginTransactionRequest{},
 			&sppb.RollbackRequest{},
 			&sppb.DeleteSessionRequest{}}, requests); err != nil {
@@ -277,28 +297,28 @@ func TestReadWriteTransaction_ErrorReturned(t *testing.T) {
 func TestBatchDML_WithMultipleDML(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	server, client := newSpannerInMemTestServer(t)
-	defer server.teardown(client)
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
 
 	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) (err error) {
-		if _, err = tx.Update(ctx, Statement{SQL: updateBarSetFoo}); err != nil {
+		if _, err = tx.Update(ctx, Statement{SQL: UpdateBarSetFoo}); err != nil {
 			return err
 		}
-		if _, err = tx.BatchUpdate(ctx, []Statement{{SQL: updateBarSetFoo}, {SQL: updateBarSetFoo}}); err != nil {
+		if _, err = tx.BatchUpdate(ctx, []Statement{{SQL: UpdateBarSetFoo}, {SQL: UpdateBarSetFoo}}); err != nil {
 			return err
 		}
-		if _, err = tx.Update(ctx, Statement{SQL: updateBarSetFoo}); err != nil {
+		if _, err = tx.Update(ctx, Statement{SQL: UpdateBarSetFoo}); err != nil {
 			return err
 		}
-		_, err = tx.BatchUpdate(ctx, []Statement{{SQL: updateBarSetFoo}})
+		_, err = tx.BatchUpdate(ctx, []Statement{{SQL: UpdateBarSetFoo}})
 		return err
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	gotReqs, err := shouldHaveReceived(server.testSpanner, []interface{}{
-		&sppb.CreateSessionRequest{},
+	gotReqs, err := shouldHaveReceived(server.TestSpanner, []interface{}{
+		&sppb.BatchCreateSessionsRequest{},
 		&sppb.BeginTransactionRequest{},
 		&sppb.ExecuteSqlRequest{},
 		&sppb.ExecuteBatchDmlRequest{},
@@ -329,7 +349,7 @@ func TestBatchDML_WithMultipleDML(t *testing.T) {
 //
 // Note: this in-place modifies serverClientMock by popping items off the
 // ReceivedRequests channel.
-func shouldHaveReceived(server testutil.InMemSpannerServer, want []interface{}) ([]interface{}, error) {
+func shouldHaveReceived(server InMemSpannerServer, want []interface{}) ([]interface{}, error) {
 	got := drainRequestsFromServer(server)
 	return got, compareRequests(want, got)
 }
@@ -358,7 +378,7 @@ func compareRequests(want []interface{}, got []interface{}) error {
 	return nil
 }
 
-func drainRequestsFromServer(server testutil.InMemSpannerServer) []interface{} {
+func drainRequestsFromServer(server InMemSpannerServer) []interface{} {
 	var reqs []interface{}
 loop:
 	for {
@@ -370,4 +390,13 @@ loop:
 		}
 	}
 	return reqs
+}
+
+func newAbortedErrorWithMinimalRetryDelay() error {
+	st := gstatus.New(codes.Aborted, "Transaction has been aborted")
+	retry := &errdetails.RetryInfo{
+		RetryDelay: ptypes.DurationProto(time.Nanosecond),
+	}
+	st, _ = st.WithDetails(retry)
+	return st.Err()
 }

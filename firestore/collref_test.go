@@ -41,7 +41,7 @@ func TestNewDoc(t *testing.T) {
 	coll := c.Collection("C")
 	got := coll.NewDoc()
 	if got.Parent != coll {
-		t.Errorf("got %v, want %v", got.Parent, coll)
+		t.Errorf("NewDoc got %v, want %v", got.Parent, coll)
 	}
 	if len(got.ID) != 20 {
 		t.Errorf("got %d-char ID, wanted 20", len(got.ID))
